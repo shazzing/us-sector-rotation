@@ -940,12 +940,26 @@ def save_trade_logs(base_trades, enh_trades, base_state, enh_state):
     enhanced_path = OUTPUT_DIR / "enhanced_trades_log.csv"
     comparison_path = OUTPUT_DIR / "trades_comparison_log.csv"
     holdings_path = OUTPUT_DIR / "current_holdings_snapshot.csv"
+    baseline_daily_pnl_path = OUTPUT_DIR / "baseline_daily_pnl.csv"
+    baseline_weekly_pnl_path = OUTPUT_DIR / "baseline_weekly_pnl.csv"
+    enhanced_daily_pnl_path = OUTPUT_DIR / "enhanced_daily_pnl.csv"
+    enhanced_weekly_pnl_path = OUTPUT_DIR / "enhanced_weekly_pnl.csv"
 
     base_trades = add_product_descriptions(base_trades)
     enh_trades = add_product_descriptions(enh_trades)
 
     base_trades.to_csv(baseline_path, index=False)
     enh_trades.to_csv(enhanced_path, index=False)
+
+    # POSITION rows are end-of-day portfolio snapshots.  They retain the
+    # entry prices and positions in the trade log, while these two reports make
+    # the daily and weekly account-level P&L easy to consume separately.
+    baseline_pnl_reports = build_pnl_reports(base_trades, "Baseline")
+    enhanced_pnl_reports = build_pnl_reports(enh_trades, "Enhanced")
+    baseline_pnl_reports["daily"].to_csv(baseline_daily_pnl_path, index=False)
+    baseline_pnl_reports["weekly"].to_csv(baseline_weekly_pnl_path, index=False)
+    enhanced_pnl_reports["daily"].to_csv(enhanced_daily_pnl_path, index=False)
+    enhanced_pnl_reports["weekly"].to_csv(enhanced_weekly_pnl_path, index=False)
 
     comparison = pd.concat(
         [
@@ -982,6 +996,67 @@ def save_trade_logs(base_trades, enh_trades, base_state, enh_state):
     print(f"Enhanced: {enhanced_path}")
     print(f"Comparison: {comparison_path}")
     print(f"Current holdings snapshot: {holdings_path}")
+    print(f"Baseline daily P&L: {baseline_daily_pnl_path}")
+    print(f"Baseline weekly P&L: {baseline_weekly_pnl_path}")
+    print(f"Enhanced daily P&L: {enhanced_daily_pnl_path}")
+    print(f"Enhanced weekly P&L: {enhanced_weekly_pnl_path}")
+
+
+def build_pnl_reports(trades, model):
+    """Return account-level daily and weekly P&L reports from POSITION rows.
+
+    The strategy writes one POSITION row per market day after applying that
+    day's orders and price movement.  Daily P&L is therefore authoritative;
+    weekly P&L is its sum, with returns compounded from the daily returns.
+    """
+    required_columns = {
+        "Date", "Action", "PositionSnapshot", "PortfolioValue", "DailyPnL",
+        "DailyReturnPct", "CumulativePnL",
+    }
+    missing_columns = required_columns.difference(trades.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Cannot build P&L report; missing trade-log columns: {missing}")
+
+    daily = trades.loc[trades["Action"].eq("POSITION")].copy()
+    daily["Date"] = pd.to_datetime(daily["Date"])
+    daily = daily.sort_values("Date").drop_duplicates("Date", keep="last")
+    numeric_columns = ["PortfolioValue", "DailyPnL", "DailyReturnPct", "CumulativePnL"]
+    daily[numeric_columns] = daily[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    daily = daily.dropna(subset=["Date", "PortfolioValue", "DailyPnL", "DailyReturnPct"])
+    daily.insert(0, "Model", model)
+    daily = daily[
+        [
+            "Model", "Date", "PortfolioValue", "DailyPnL", "DailyReturnPct",
+            "CumulativePnL", "PositionSnapshot",
+        ]
+    ]
+
+    weekly_columns = [
+        "Model", "WeekStart", "WeekEnd", "StartPortfolioValue", "EndPortfolioValue",
+        "WeeklyPnL", "WeeklyReturnPct", "CumulativePnL",
+    ]
+    if daily.empty:
+        return {"daily": daily, "weekly": pd.DataFrame(columns=weekly_columns)}
+
+    daily = daily.reset_index(drop=True)
+    daily["Week"] = daily["Date"].dt.to_period("W-FRI")
+    weekly = (
+        daily.groupby("Week", sort=True)
+        .agg(
+            WeekStart=("Date", "first"),
+            WeekEnd=("Date", "last"),
+            EndPortfolioValue=("PortfolioValue", "last"),
+            WeeklyPnL=("DailyPnL", "sum"),
+            WeeklyReturnPct=("DailyReturnPct", lambda values: ((1 + values / 100).prod() - 1) * 100),
+            CumulativePnL=("CumulativePnL", "last"),
+        )
+        .reset_index(drop=True)
+    )
+    weekly.insert(0, "Model", model)
+    weekly["StartPortfolioValue"] = weekly["EndPortfolioValue"] - weekly["WeeklyPnL"]
+    weekly = weekly[weekly_columns]
+    return {"daily": daily.drop(columns="Week"), "weekly": weekly}
 
 # ----------------------------
 # YEARLY
